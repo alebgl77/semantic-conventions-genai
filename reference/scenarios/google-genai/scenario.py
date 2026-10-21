@@ -7,13 +7,53 @@ against a mock Google GenAI server, with manual OTel spans.
 import json
 import os
 from contextlib import contextmanager
+from urllib.parse import urlparse
 
 from opentelemetry.trace import SpanKind, StatusCode
-from reference_shared import flush_and_shutdown, reference_event_logger, reference_tracer, setup_otel
+from reference_shared import (
+    flush_and_shutdown,
+    reference_event_logger,
+    reference_meter,
+    reference_tracer,
+    setup_otel,
+)
 
 MOCK_BASE_URL = os.environ["MOCK_LLM_URL"]
+_SERVER_ADDRESS = urlparse(MOCK_BASE_URL).hostname
 
 _reference_tracer = reference_tracer()
+_reference_meter = reference_meter()
+
+_operation_input_tokens = _reference_meter.create_histogram(
+    "gen_ai.client.inference.operation.input_tokens",
+    unit="{token}",
+    description="The number of input (prompt) tokens used per inference operation.",
+)
+_operation_output_tokens = _reference_meter.create_histogram(
+    "gen_ai.client.inference.operation.output_tokens",
+    unit="{token}",
+    description="The number of output (completion) tokens used per inference operation.",
+)
+_input_tokens = _reference_meter.create_counter(
+    "gen_ai.client.inference.usage.input_tokens",
+    unit="{token}",
+    description="The number of input (prompt) tokens used, including cached tokens.",
+)
+_output_tokens = _reference_meter.create_counter(
+    "gen_ai.client.inference.usage.output_tokens",
+    unit="{token}",
+    description="The number of output (completion) tokens used, including reasoning tokens.",
+)
+_cache_read_input_tokens = _reference_meter.create_counter(
+    "gen_ai.client.inference.usage.cache_read.input_tokens",
+    unit="{token}",
+    description="The number of input tokens served from a provider-managed cache.",
+)
+_reasoning_output_tokens = _reference_meter.create_counter(
+    "gen_ai.client.inference.usage.reasoning.output_tokens",
+    unit="{token}",
+    description="The number of output tokens used for reasoning.",
+)
 
 
 @contextmanager
@@ -96,7 +136,7 @@ def _modality_usage_attributes(usage_metadata):
         for entry in details or []:
             modality = _entry_modality(entry)
             count = getattr(entry, "token_count", None)
-            if modality and count is not None:
+            if modality and count:
                 attrs[f"gen_ai.usage.{modality}.{suffix}"] = count
     return attrs
 
@@ -127,6 +167,56 @@ def _usage_attributes(um):
         attrs["gen_ai.usage.reasoning.output_tokens"] = reasoning_tokens
     attrs.update(_modality_usage_attributes(um))
     return attrs
+
+
+def _usage_metric_attributes(request_model, response):
+    """Build the attributes shared by every inference usage instrument."""
+    attributes = {
+        "gen_ai.operation.name": "chat",
+        "gen_ai.provider.name": "gcp.gemini",
+        "gen_ai.request.model": request_model,
+    }
+    if response.model_version:
+        attributes["gen_ai.response.model"] = response.model_version
+    return attributes
+
+
+def _add_by_modality(counter, total, suffix, usage, metric_attributes):
+    """Split `total` across the modalities Google reported for `suffix`.
+
+    Whatever the per-modality entries leave unaccounted for goes to `unknown`:
+    tool-use prompt tokens and reasoning tokens are counted in the totals but
+    carry no modality of their own.
+    """
+    remainder = total
+    for modality in _MODALITY_MAP.values():
+        count = usage.get(f"gen_ai.usage.{modality}.{suffix}")
+        if count:
+            counter.add(count, {**metric_attributes, "gen_ai.token.modality": modality})
+            remainder -= count
+    if remainder > 0:
+        counter.add(remainder, {**metric_attributes, "gen_ai.token.modality": "unknown"})
+
+
+def _record_inference_usage(usage, metric_attributes):
+    """Record the usage instruments from the same `gen_ai.usage.*` values the span carries."""
+    input_tokens = usage.get("gen_ai.usage.input_tokens")
+    if input_tokens is not None:
+        _operation_input_tokens.record(input_tokens, metric_attributes)
+        _add_by_modality(_input_tokens, input_tokens, "input_tokens", usage, metric_attributes)
+    output_tokens = usage.get("gen_ai.usage.output_tokens")
+    if output_tokens is not None:
+        _operation_output_tokens.record(output_tokens, metric_attributes)
+        _add_by_modality(_output_tokens, output_tokens, "output_tokens", usage, metric_attributes)
+    cache_read_tokens = usage.get("gen_ai.usage.cache_read.input_tokens")
+    if cache_read_tokens:
+        _add_by_modality(
+            _cache_read_input_tokens, cache_read_tokens, "cache_read.input_tokens", usage, metric_attributes
+        )
+    reasoning_tokens = usage.get("gen_ai.usage.reasoning.output_tokens")
+    if reasoning_tokens:
+        # Google reports no modality for thoughts tokens.
+        _reasoning_output_tokens.add(reasoning_tokens, {**metric_attributes, "gen_ai.token.modality": "unknown"})
 
 
 def _emit_inference_event(request_model, input_messages, output_messages, response, usage):
@@ -168,13 +258,18 @@ def run_chat():
         "gen_ai.operation.name": "chat",
         "gen_ai.provider.name": "gcp.gemini",
         "gen_ai.request.model": request_model,
+        "server.address": _SERVER_ADDRESS,
     }
-    with _reference_tracer.start_as_current_span("chat gemini-2.0-flash", attributes=span_attributes) as span:
+    with _reference_tracer.start_as_current_span(
+        "chat gemini-2.0-flash", kind=SpanKind.CLIENT, attributes=span_attributes
+    ) as span:
         prompt_text = "Say hello."
         response = client.models.generate_content(
             model=request_model,
             contents=prompt_text,
         )
+        if response.response_id:
+            span.set_attribute("gen_ai.response.id", response.response_id)
         if response.model_version:
             span.set_attribute("gen_ai.response.model", response.model_version)
         if response.candidates and response.candidates[0].finish_reason:
@@ -184,6 +279,7 @@ def run_chat():
             usage = _usage_attributes(response.usage_metadata)
             for attr, value in usage.items():
                 span.set_attribute(attr, value)
+            _record_inference_usage(usage, _usage_metric_attributes(request_model, response))
 
         input_messages = [{"role": "user", "parts": [{"type": "text", "content": prompt_text}]}]
         output_messages = [
@@ -224,6 +320,7 @@ def run_interactions_continuation():
         "gen_ai.request.model": request_model,
         "gen_ai.agent.name": "interactions_agent",
         "gen_ai.request.previous_response.id": previous_interaction_id,
+        "server.address": _SERVER_ADDRESS,
     }
     with _reference_tracer.start_as_current_span(
         "invoke_agent interactions_agent", kind=SpanKind.CLIENT, attributes=span_attributes
@@ -305,27 +402,27 @@ def run_chat_tool_call():
         "gen_ai.operation.name": "chat",
         "gen_ai.provider.name": "gcp.gemini",
         "gen_ai.request.model": request_model,
+        "server.address": _SERVER_ADDRESS,
     }
     with (
         _patch_automatic_function_calling(),
-        _reference_tracer.start_as_current_span("chat gemini-2.0-flash", attributes=span_attributes_2) as span,
+        _reference_tracer.start_as_current_span(
+            "chat gemini-2.0-flash", kind=SpanKind.CLIENT, attributes=span_attributes_2
+        ) as span,
     ):
         span.set_attribute(
             "gen_ai.tool.definitions",
             json.dumps(
                 [
                     {
-                        "function_declarations": [
-                            {
-                                "name": "get_weather",
-                                "description": "Get the current weather",
-                                "parameters": {
-                                    "type": "object",
-                                    "properties": {"location": {"type": "string", "description": "City name"}},
-                                    "required": ["location"],
-                                },
-                            }
-                        ]
+                        "type": "function",
+                        "name": "get_weather",
+                        "description": "Get the current weather",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {"location": {"type": "string", "description": "City name"}},
+                            "required": ["location"],
+                        },
                     }
                 ]
             ),
@@ -335,6 +432,8 @@ def run_chat_tool_call():
             contents="What's the weather in Seattle?",
             config=types.GenerateContentConfig(tools=tools),
         )
+        if response.response_id:
+            span.set_attribute("gen_ai.response.id", response.response_id)
         if response.model_version:
             span.set_attribute("gen_ai.response.model", response.model_version)
         if response.candidates and response.candidates[0].finish_reason:
@@ -344,6 +443,7 @@ def run_chat_tool_call():
             usage = _usage_attributes(response.usage_metadata)
             for attr, value in usage.items():
                 span.set_attribute(attr, value)
+            _record_inference_usage(usage, _usage_metric_attributes(request_model, response))
 
         tool_call = None
         if response.candidates and response.candidates[0].content.parts:
@@ -404,6 +504,7 @@ def run_chat_multimodal():
             usage = _usage_attributes(response.usage_metadata)
             for attr, value in usage.items():
                 span.set_attribute(attr, value)
+            _record_inference_usage(usage, _usage_metric_attributes(request_model, response))
 
         input_messages = [
             {
@@ -458,6 +559,7 @@ def run_generate_media():
                 usage = _usage_attributes(response.usage_metadata)
                 for attr, value in usage.items():
                     span.set_attribute(attr, value)
+                _record_inference_usage(usage, _usage_metric_attributes(request_model, response))
 
             input_messages = [{"role": "user", "parts": [{"type": "text", "content": f"Generate {label} output."}]}]
             output_parts = []
@@ -494,9 +596,13 @@ def run_chat_streaming():
         "gen_ai.operation.name": "chat",
         "gen_ai.provider.name": "gcp.gemini",
         "gen_ai.request.model": request_model,
+        "server.address": _SERVER_ADDRESS,
     }
-    with _reference_tracer.start_as_current_span("chat gemini-2.0-flash", attributes=span_attributes_3) as span:
+    with _reference_tracer.start_as_current_span(
+        "chat gemini-2.0-flash", kind=SpanKind.CLIENT, attributes=span_attributes_3
+    ) as span:
         text = ""
+        model_version = None
         last_chunk = None
         for chunk in client.models.generate_content_stream(
             model=request_model,
@@ -504,9 +610,11 @@ def run_chat_streaming():
         ):
             if chunk.text:
                 text += chunk.text
+            if chunk.model_version:
+                model_version = chunk.model_version
             last_chunk = chunk
-        if last_chunk and last_chunk.model_version:
-            span.set_attribute("gen_ai.response.model", last_chunk.model_version)
+        if model_version:
+            span.set_attribute("gen_ai.response.model", model_version)
         if last_chunk and last_chunk.candidates and last_chunk.candidates[0].finish_reason:
             span.set_attribute("gen_ai.response.finish_reasons", [str(last_chunk.candidates[0].finish_reason)])
         if last_chunk and hasattr(last_chunk, "usage_metadata") and last_chunk.usage_metadata:
@@ -541,8 +649,11 @@ def run_embeddings():
         "gen_ai.operation.name": "embeddings",
         "gen_ai.provider.name": "gcp.gemini",
         "gen_ai.request.model": request_model,
+        "server.address": _SERVER_ADDRESS,
     }
-    with _reference_tracer.start_as_current_span("embeddings text-embedding-004", attributes=span_attributes_4) as span:
+    with _reference_tracer.start_as_current_span(
+        "embeddings text-embedding-004", kind=SpanKind.CLIENT, attributes=span_attributes_4
+    ) as span:
         response = client.models.embed_content(
             model=request_model,
             contents="Hello, world!",
@@ -579,6 +690,7 @@ def run_create_agent():
         "gen_ai.provider.name": "gcp.gemini",
         "gen_ai.request.model": request_model,
         "gen_ai.agent.name": agent_name,
+        "server.address": _SERVER_ADDRESS,
     }
     with _reference_tracer.start_as_current_span(
         f"create_agent {agent_name}", kind=SpanKind.CLIENT, attributes=span_attributes
