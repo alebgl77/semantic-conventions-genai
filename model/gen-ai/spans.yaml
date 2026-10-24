@@ -424,6 +424,15 @@ spans:
         note: >
           The output token count of the generation identified by `gen_ai.response.id`, as carried
           on the fetched response. A snapshot of that generation, not additive across spans.
+      - ref: gen_ai.usage.cache_read.input_tokens
+        requirement_level:
+          recommended: When available and non-zero.
+      - ref: gen_ai.usage.cache_write.input_tokens
+        requirement_level:
+          recommended: When available and non-zero.
+      - ref: gen_ai.usage.reasoning.output_tokens
+        requirement_level:
+          recommended: When available and non-zero.
 
   - type: gen_ai.memory.client
     requirement_level: recommended
@@ -830,6 +839,12 @@ span_refinements:
         note: >
           Corresponds to `usage.output_tokens` on the fetched response. Absent while the response
           is `queued` or `in_progress`, and on a `failed` response without usage.
+      - ref: gen_ai.usage.cache_read.input_tokens
+        note: >
+          Corresponds to `usage.input_tokens_details.cached_tokens` on the fetched response.
+      - ref: gen_ai.usage.reasoning.output_tokens
+        note: >
+          Corresponds to `usage.output_tokens_details.reasoning_tokens` on the fetched response.
 
   - id: azure.ai.gen_ai.client.inference
     ref: gen_ai.client.inference
